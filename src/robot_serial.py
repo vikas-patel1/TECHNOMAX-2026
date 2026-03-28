@@ -52,6 +52,8 @@ if _cfg is not None:
     GRIPPER_CLOSE  = _cfg.GRIPPER_CLOSE_DEG
     GRIPPER_WAIT   = _cfg.GRIPPER_WAIT_S
     DEBUG          = _cfg.DEBUG
+    SERVO_OFFSETS  = getattr(_cfg, 'SERVO_OFFSETS',  {1:0.0,2:0.0,3:0.0,4:90.0,5:0.0})
+    SERVO_REVERSED = getattr(_cfg, 'SERVO_REVERSED', {1:False,2:True,3:False,4:False,5:False})
     print("[robot_serial] loaded config")
 else:
     print("[robot_serial] config.py not found — using built-in defaults")
@@ -60,8 +62,10 @@ else:
     SERIAL_TIMEOUT = 2.0
     SERIAL_RETRIES = 3
     HOME_ANGLES    = [90.0, 20.0, 160.0, -80.0]
-    GRIPPER_OPEN   = 10.0
-    GRIPPER_CLOSE  = 75.0
+    GRIPPER_OPEN   = 75.0    # matches config.py GRIPPER_OPEN_DEG
+    GRIPPER_CLOSE  = 120.0   # matches config.py GRIPPER_CLOSE_DEG
+    SERVO_OFFSETS  = {1:0.0, 2:0.0, 3:0.0, 4:90.0, 5:0.0}
+    SERVO_REVERSED = {1:False, 2:True, 3:False, 4:False, 5:False}
     GRIPPER_WAIT   = 0.4
     DEBUG          = True
 
@@ -190,7 +194,7 @@ class _MockArduino(threading.Thread):
                 raw = list(struct.unpack('>5h', packet[1:11]))
 
                 # Clamp to safe ranges (mirrors real firmware limits)
-                limits = [(0,1800),(0,1700),(0,1700),(-900,900),(100,800)]
+                limits = [(0,1800),(0,1700),(0,1700),(-900,900),(0,1800)]   # gripper full range 0-180 deg
                 clamped = [max(lo, min(hi, v)) for v, (lo, hi) in zip(raw, limits)]
 
                 # Simulate movement delay proportional to angle change
@@ -279,6 +283,71 @@ class _MockSerial:
 # =============================================================================
 # ROBOT ARM  —  the public API your state machine calls
 # =============================================================================
+
+# =============================================================================
+# SERVO MAPPING
+# Converts robot-frame angles from kinematics.py to physical servo angles.
+# Called once inside set_joints() before building the serial packet.
+# =============================================================================
+
+def _apply_servo_mapping(angles_deg: list[float]) -> list[float]:
+    """
+    Map robot-frame joint angles to physical servo angles.
+
+    All servos are 180-degree positional servos (MG996R, MG90S, SG90).
+    Output is always clamped to [0, 180] degrees — sending anything outside
+    this range stalls the servo against its mechanical stop and draws high
+    current, which can damage the servo or the power supply.
+
+    Two transforms per joint (applied in this order):
+      1. Reverse direction if SERVO_REVERSED[joint] is True
+             servo = 180 - robot
+      2. Add offset
+             servo = servo + SERVO_OFFSETS[joint]
+      3. Clamp to [0, 180]  ← always, no exceptions
+
+    Parameters
+    ----------
+    angles_deg : [J1, J2, J3, J4, gripper] in robot-frame degrees
+
+    Returns
+    -------
+    [J1, J2, J3, J4, gripper] in physical servo degrees, each in [0, 180]
+    """
+    mapped = list(angles_deg)
+    for i, joint_num in enumerate(range(1, 6)):
+        val = mapped[i]
+        # Step 1 — reverse direction if needed
+        if SERVO_REVERSED.get(joint_num, False):
+            val = 180.0 - val
+        # Step 2 — apply offset
+        val = val + SERVO_OFFSETS.get(joint_num, 0.0)
+        # Step 3 — HARD CLAMP to 0-180 (180-degree positional servo limit)
+        val = max(0.0, min(180.0, val))
+        mapped[i] = val
+        if DEBUG and (mapped[i] == 0.0 or mapped[i] == 180.0):
+            original = angles_deg[i]
+            if original != 0.0 and original != 180.0:
+                print(f"[servo_map] WARNING: J{joint_num} clamped "
+                      f"robot={original:.1f}° → servo={val:.1f}° "
+                      f"(hit 180-deg limit)")
+    return mapped
+
+
+def _reverse_servo_mapping(angles_deg: list[float]) -> list[float]:
+    """
+    Inverse of _apply_servo_mapping — convert servo angles back to robot frame.
+    Used to interpret the Arduino reply in robot-frame angles.
+    """
+    mapped = list(angles_deg)
+    for i, joint_num in enumerate(range(1, 6)):
+        val = mapped[i]
+        val = val - SERVO_OFFSETS.get(joint_num, 0.0)
+        if SERVO_REVERSED.get(joint_num, False):
+            val = 180.0 - val
+        mapped[i] = val
+    return mapped
+
 
 class RobotArm:
     """
@@ -388,6 +457,11 @@ class RobotArm:
             time.sleep(0.01)
         return False
 
+    @property
+    def is_connected(self) -> bool:
+        """True if the arm is currently connected."""
+        return self._connected
+
     def disconnect(self) -> None:
         """Close the connection and shut down mock if running."""
         if self._serial and self._serial.is_open:
@@ -425,19 +499,24 @@ class RobotArm:
         gripper_angle = gripper if gripper is not None else self._current[4]
         all_angles    = list(joint_angles_deg) + [gripper_angle]
 
+        # Apply servo mapping: convert robot-frame angles to physical servo angles
+        servo_angles = _apply_servo_mapping(all_angles)
+
         # Clear any stale data once before the first send.
         # Do NOT reset inside the retry loop — that drains the NAK reply
         # the firmware just sent, causing every retry to time out.
         self._serial.reset_input_buffer()       # type: ignore[union-attr]
 
         for attempt in range(1, SERIAL_RETRIES + 1):
-            packet = self._build_packet(all_angles)
+            packet = self._build_packet(servo_angles)
             self._serial.write(packet)           # type: ignore[union-attr]
             reply = self._read_reply()
 
             if reply is not None and reply['status'] == 'ACK':
-                self._current = reply['angles']
-                return reply['angles']
+                # Convert servo angles back to robot frame before storing
+                robot_angles = _reverse_servo_mapping(reply['angles'])
+                self._current = robot_angles
+                return robot_angles
             if reply is not None and reply['status'] == 'NAK':
                 print(f"[RobotArm] NAK on attempt {attempt}/{SERIAL_RETRIES} "
                       f"— resending")
